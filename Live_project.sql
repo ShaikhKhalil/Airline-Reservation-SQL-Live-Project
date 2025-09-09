@@ -1,0 +1,547 @@
+
+CREATE DATABASE airline_reservation_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE airline_reservation_db;
+
+-- -------------------------------------------------------------
+-- 1) Core lookup tables
+-- -------------------------------------------------------------
+
+CREATE TABLE airports (
+  airport_id        INT AUTO_INCREMENT PRIMARY KEY,
+  iata_code         CHAR(3) NOT NULL UNIQUE,
+  name              VARCHAR(100) NOT NULL,
+  city              VARCHAR(80) NOT NULL,
+  country           VARCHAR(80) NOT NULL,
+  timezone          VARCHAR(60) NOT NULL
+);
+
+CREATE TABLE aircraft_models (
+  model_id          INT AUTO_INCREMENT PRIMARY KEY,
+  manufacturer      VARCHAR(60) NOT NULL,
+  model_name        VARCHAR(60) NOT NULL,
+  seat_capacity     INT NOT NULL CHECK (seat_capacity > 0),
+  notes             VARCHAR(255) NULL,
+  UNIQUE KEY uq_model (manufacturer, model_name)
+);
+
+CREATE TABLE aircrafts (
+  aircraft_id       INT AUTO_INCREMENT PRIMARY KEY,
+  tail_number       VARCHAR(15) NOT NULL UNIQUE, -- e.g., VT-ABC
+  model_id          INT NOT NULL,
+  in_service        TINYINT(1) NOT NULL DEFAULT 1,
+  CONSTRAINT fk_aircraft_model
+    FOREIGN KEY (model_id) REFERENCES aircraft_models(model_id)
+      ON UPDATE CASCADE
+);
+
+-- Seats are per-aircraft (physical seat map)
+CREATE TABLE seats (
+  seat_id           INT AUTO_INCREMENT PRIMARY KEY,
+  aircraft_id       INT NOT NULL,
+  seat_number       VARCHAR(5) NOT NULL,        -- e.g., 12A
+  cabin_class       ENUM('ECONOMY','BUSINESS','FIRST') NOT NULL,
+  is_window         TINYINT(1) NOT NULL DEFAULT 0,
+  is_aisle          TINYINT(1) NOT NULL DEFAULT 0,
+  UNIQUE KEY uq_seat (aircraft_id, seat_number),
+  KEY idx_seats_aircraft (aircraft_id, cabin_class),
+  CONSTRAINT fk_seat_aircraft
+    FOREIGN KEY (aircraft_id) REFERENCES aircrafts(aircraft_id)
+      ON DELETE CASCADE
+);
+
+-- -------------------------------------------------------------
+-- 2) Flight schedule tables
+-- -------------------------------------------------------------
+
+-- "flights" are routes + flight numbers (template schedule)
+CREATE TABLE flights (
+  flight_id               INT AUTO_INCREMENT PRIMARY KEY,
+  flight_number           VARCHAR(8) NOT NULL UNIQUE,   -- e.g., AI101
+  origin_airport_id       INT NOT NULL,
+  destination_airport_id  INT NOT NULL,
+  scheduled_duration_mins INT NOT NULL CHECK (scheduled_duration_mins > 0),
+  distance_km             INT NULL,
+  CONSTRAINT fk_flight_origin
+    FOREIGN KEY (origin_airport_id) REFERENCES airports(airport_id),
+  CONSTRAINT fk_flight_dest
+    FOREIGN KEY (destination_airport_id) REFERENCES airports(airport_id),
+  CONSTRAINT chk_flight_route CHECK (origin_airport_id <> destination_airport_id)
+);
+
+-- Optional base fares per flight & cabin
+CREATE TABLE flight_fares (
+  fare_id           INT AUTO_INCREMENT PRIMARY KEY,
+  flight_id         INT NOT NULL,
+  cabin_class       ENUM('ECONOMY','BUSINESS','FIRST') NOT NULL,
+  base_price        DECIMAL(10,2) NOT NULL CHECK (base_price >= 0),
+  UNIQUE KEY uq_fare (flight_id, cabin_class),
+  CONSTRAINT fk_fare_flight
+    FOREIGN KEY (flight_id) REFERENCES flights(flight_id)
+      ON DELETE CASCADE
+);
+
+-- Each actual departure (dated) is a flight_instance
+CREATE TABLE flight_instances (
+  flight_instance_id INT AUTO_INCREMENT PRIMARY KEY,
+  flight_id          INT NOT NULL,
+  aircraft_id        INT NOT NULL,
+  departure_datetime DATETIME NOT NULL,
+  arrival_datetime   DATETIME NOT NULL,
+  status             ENUM('SCHEDULED','DELAYED','CANCELLED','DEPARTED','ARRIVED')
+                       NOT NULL DEFAULT 'SCHEDULED',
+  UNIQUE KEY uq_sched (flight_id, departure_datetime),
+  KEY idx_fi_time (departure_datetime, status),
+  CONSTRAINT fk_fi_flight
+    FOREIGN KEY (flight_id) REFERENCES flights(flight_id)
+      ON DELETE CASCADE,
+  CONSTRAINT fk_fi_aircraft
+    FOREIGN KEY (aircraft_id) REFERENCES aircrafts(aircraft_id),
+  CONSTRAINT chk_times CHECK (arrival_datetime > departure_datetime)
+);
+
+-- -------------------------------------------------------------
+-- 3) Customers, Passengers, Bookings & Tickets
+-- -------------------------------------------------------------
+
+CREATE TABLE customers (
+  customer_id     INT AUTO_INCREMENT PRIMARY KEY,
+  full_name       VARCHAR(100) NOT NULL,
+  email           VARCHAR(120) NOT NULL UNIQUE,
+  phone           VARCHAR(30)  NULL,
+  created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE passengers (
+  passenger_id    INT AUTO_INCREMENT PRIMARY KEY,
+  full_name       VARCHAR(100) NOT NULL,
+  dob             DATE NULL,
+  gender          ENUM('M','F','X') NULL,
+  passport_no     VARCHAR(30) NULL,
+  nationality     VARCHAR(60) NULL,
+  customer_id     INT NULL,  -- who booked for them (optional)
+  CONSTRAINT fk_passenger_customer
+    FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
+      ON DELETE SET NULL
+);
+
+CREATE TABLE bookings (
+  booking_id      INT AUTO_INCREMENT PRIMARY KEY,
+  pnr             CHAR(6) NOT NULL UNIQUE,  -- auto-generated by trigger if blank
+  customer_id     INT NOT NULL,
+  status          ENUM('PENDING','CONFIRMED','CANCELLED') NOT NULL DEFAULT 'PENDING',
+  payment_status  ENUM('UNPAID','PAID','REFUNDED') NOT NULL DEFAULT 'UNPAID',
+  total_amount    DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_booking_customer
+    FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
+);
+
+CREATE TABLE tickets (
+  ticket_id           INT AUTO_INCREMENT PRIMARY KEY,
+  booking_id          INT NOT NULL,
+  passenger_id        INT NOT NULL,
+  flight_instance_id  INT NOT NULL,
+  fare_class          ENUM('ECONOMY','BUSINESS','FIRST') NOT NULL,
+  price_paid          DECIMAL(10,2) NOT NULL CHECK (price_paid >= 0),
+  status              ENUM('BOOKED','CANCELLED','CHECKED_IN','BOARDED') NOT NULL DEFAULT 'BOOKED',
+  seat_id             INT NULL,
+  -- prevent double-assigning the same seat for an active ticket on a flight
+  UNIQUE KEY uq_seat_assign (flight_instance_id, seat_id),
+  KEY idx_ticket_booking (booking_id),
+  KEY idx_ticket_fi (flight_instance_id, status),
+  CONSTRAINT fk_ticket_booking
+    FOREIGN KEY (booking_id) REFERENCES bookings(booking_id)
+      ON DELETE CASCADE,
+  CONSTRAINT fk_ticket_passenger
+    FOREIGN KEY (passenger_id) REFERENCES passengers(passenger_id)
+      ON DELETE CASCADE,
+  CONSTRAINT fk_ticket_fi
+    FOREIGN KEY (flight_instance_id) REFERENCES flight_instances(flight_instance_id)
+      ON DELETE CASCADE,
+  CONSTRAINT fk_ticket_seat
+    FOREIGN KEY (seat_id) REFERENCES seats(seat_id)
+      ON DELETE SET NULL
+);
+
+CREATE TABLE payments (
+  payment_id      INT AUTO_INCREMENT PRIMARY KEY,
+  booking_id      INT NOT NULL,
+  amount          DECIMAL(10,2) NOT NULL CHECK (amount >= 0),
+  method          ENUM('CARD','UPI','NETBANKING','CASH') NOT NULL,
+  status          ENUM('INITIATED','SUCCESS','FAILED','REFUNDED') NOT NULL DEFAULT 'INITIATED',
+  txn_ref         VARCHAR(64) NULL,
+  paid_at         DATETIME NULL,
+  CONSTRAINT fk_payment_booking
+    FOREIGN KEY (booking_id) REFERENCES bookings(booking_id)
+      ON DELETE CASCADE
+);
+
+-- -------------------------------------------------------------
+-- 4) Helpers: function to generate PNR
+-- -------------------------------------------------------------
+
+DELIMITER $$
+CREATE FUNCTION fn_generate_pnr() RETURNS CHAR(6)
+NOT DETERMINISTIC
+NO SQL
+BEGIN
+  -- Use a restricted alphabet to avoid ambiguous chars (I, O, 1, 0).
+  DECLARE chars VARCHAR(32) DEFAULT 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  DECLARE i INT DEFAULT 0;
+  DECLARE p CHAR(6) DEFAULT '';
+  WHILE i < 6 DO
+    SET p = CONCAT(p, SUBSTRING(chars, FLOOR(1 + RAND() * LENGTH(chars)), 1));
+    SET i = i + 1;
+  END WHILE;
+  RETURN p;
+END$$
+DELIMITER ;
+
+-- -------------------------------------------------------------
+-- 5) Triggers
+-- -------------------------------------------------------------
+
+-- Auto-generate PNR if blank
+DELIMITER $$
+CREATE TRIGGER trg_bookings_bi BEFORE INSERT ON bookings
+FOR EACH ROW
+BEGIN
+  IF NEW.pnr IS NULL OR NEW.pnr = '' THEN
+    SET NEW.pnr = fn_generate_pnr();
+  END IF;
+END$$
+DELIMITER ;
+
+-- Keep bookings.total_amount in sync with ticket prices
+DELIMITER $$
+CREATE TRIGGER trg_tickets_ai AFTER INSERT ON tickets
+FOR EACH ROW
+BEGIN
+  UPDATE bookings
+  SET total_amount = (SELECT COALESCE(SUM(price_paid),0) FROM tickets WHERE booking_id = NEW.booking_id)
+  WHERE booking_id = NEW.booking_id;
+END$$
+DELIMITER ;
+
+DELIMITER $$
+CREATE TRIGGER trg_tickets_au AFTER UPDATE ON tickets
+FOR EACH ROW
+BEGIN
+  IF NEW.price_paid <> OLD.price_paid OR NEW.booking_id <> OLD.booking_id THEN
+    UPDATE bookings
+    SET total_amount = (SELECT COALESCE(SUM(price_paid),0) FROM tickets WHERE booking_id = NEW.booking_id)
+    WHERE booking_id = NEW.booking_id;
+  END IF;
+END$$
+DELIMITER ;
+
+DELIMITER $$
+CREATE TRIGGER trg_tickets_ad AFTER DELETE ON tickets
+FOR EACH ROW
+BEGIN
+  UPDATE bookings
+  SET total_amount = (SELECT COALESCE(SUM(price_paid),0) FROM tickets WHERE booking_id = OLD.booking_id)
+  WHERE booking_id = OLD.booking_id;
+END$$
+DELIMITER ;
+
+-- Prevent ticket insert for cancelled flight or wrong seat/aircraft
+DELIMITER $$
+CREATE TRIGGER trg_tickets_bi BEFORE INSERT ON tickets
+FOR EACH ROW
+BEGIN
+  IF (SELECT status FROM flight_instances WHERE flight_instance_id = NEW.flight_instance_id) = 'CANCELLED' THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Cannot book on a cancelled flight.';
+  END IF;
+
+  IF NEW.seat_id IS NOT NULL THEN
+    IF (SELECT s.aircraft_id FROM seats s WHERE s.seat_id = NEW.seat_id) <>
+       (SELECT fi.aircraft_id FROM flight_instances fi WHERE fi.flight_instance_id = NEW.flight_instance_id) THEN
+      SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Seat does not belong to this flight''s aircraft.';
+    END IF;
+  END IF;
+END$$
+DELIMITER ;
+
+-- On successful payment -> mark booking paid + confirmed
+DELIMITER $$
+CREATE TRIGGER trg_payments_au AFTER UPDATE ON payments
+FOR EACH ROW
+BEGIN
+  IF NEW.status = 'SUCCESS' AND OLD.status <> 'SUCCESS' THEN
+    UPDATE bookings
+      SET payment_status = 'PAID',
+          status = CASE WHEN status = 'PENDING' THEN 'CONFIRMED' ELSE status END
+    WHERE booking_id = NEW.booking_id;
+  END IF;
+END$$
+DELIMITER ;
+
+-- -------------------------------------------------------------
+-- 6) Views (Availability + Booking Summaries)
+-- -------------------------------------------------------------
+
+-- View: Availability per flight instance & cabin
+CREATE OR REPLACE VIEW v_flight_availability AS
+SELECT
+  fi.flight_instance_id,
+  f.flight_number,
+  o.iata_code AS origin,
+  d.iata_code AS destination,
+  fi.departure_datetime,
+  fi.arrival_datetime,
+  fi.status AS flight_status,
+  s.cabin_class,
+  COUNT(s.seat_id) AS total_seats,
+  COUNT(s.seat_id)
+    - COALESCE(SUM(CASE WHEN t.status IN ('BOOKED','CHECKED_IN','BOARDED') THEN 1 ELSE 0 END),0) AS available_seats
+FROM flight_instances fi
+JOIN flights f            ON f.flight_id = fi.flight_id
+JOIN airports o           ON o.airport_id = f.origin_airport_id
+JOIN airports d           ON d.airport_id = f.destination_airport_id
+JOIN seats s              ON s.aircraft_id = fi.aircraft_id
+LEFT JOIN tickets t
+  ON t.flight_instance_id = fi.flight_instance_id
+ AND t.seat_id = s.seat_id
+GROUP BY
+  fi.flight_instance_id, f.flight_number, o.iata_code, d.iata_code,
+  fi.departure_datetime, fi.arrival_datetime, fi.status, s.cabin_class;
+
+-- View: Booking summary with ticket count & amount
+CREATE OR REPLACE VIEW v_booking_summary AS
+SELECT
+  b.booking_id,
+  b.pnr,
+  c.full_name AS customer_name,
+  b.status AS booking_status,
+  b.payment_status,
+  b.total_amount,
+  COUNT(t.ticket_id) AS tickets_count,
+  b.created_at
+FROM bookings b
+JOIN customers c ON c.customer_id = b.customer_id
+LEFT JOIN tickets t ON t.booking_id = b.booking_id
+GROUP BY b.booking_id, b.pnr, c.full_name, b.status, b.payment_status, b.total_amount, b.created_at;
+
+-- -------------------------------------------------------------
+-- 7) Procedures (seat generation, search flights)
+-- -------------------------------------------------------------
+
+-- Generate a standard 30-row A320-ish 3-3 seat map for an aircraft:
+-- Rows 1-3 = BUSINESS, Rows 4-30 = ECONOMY
+DELIMITER $$
+CREATE PROCEDURE sp_seed_aircraft_seats(IN p_aircraft_id INT)
+BEGIN
+  DECLARE r INT DEFAULT 1;
+  DECLARE c INT;
+  DECLARE letter CHAR(1);
+
+  WHILE r <= 30 DO
+    SET c = 1;
+    WHILE c <= 6 DO
+      CASE c
+        WHEN 1 THEN SET letter = 'A';
+        WHEN 2 THEN SET letter = 'B';
+        WHEN 3 THEN SET letter = 'C';
+        WHEN 4 THEN SET letter = 'D';
+        WHEN 5 THEN SET letter = 'E';
+        WHEN 6 THEN SET letter = 'F';
+      END CASE;
+
+      INSERT INTO seats (aircraft_id, seat_number, cabin_class, is_window, is_aisle)
+      VALUES (p_aircraft_id,
+              CONCAT(r, letter),
+              IF(r <= 3, 'BUSINESS', 'ECONOMY'),
+              (c IN (1,6)),
+              (c IN (3,4)));
+
+      SET c = c + 1;
+    END WHILE;
+    SET r = r + 1;
+  END WHILE;
+END$$
+DELIMITER ;
+
+-- Search flights by origin, destination and date with minimum seats needed
+DELIMITER $$
+CREATE PROCEDURE sp_search_flights(
+  IN p_origin CHAR(3),
+  IN p_destination CHAR(3),
+  IN p_departure_date DATE,
+  IN p_pax_required INT
+)
+BEGIN
+  SELECT *
+  FROM v_flight_availability v
+  WHERE v.origin = p_origin
+    AND v.destination = p_destination
+    AND DATE(v.departure_datetime) = p_departure_date
+    AND v.available_seats >= p_pax_required
+  ORDER BY v.departure_datetime, v.cabin_class;
+END$$
+DELIMITER ;
+
+-- -------------------------------------------------------------
+-- 8) Sample Data (airports, aircraft, seats, flights, fares, instances)
+-- -------------------------------------------------------------
+
+-- Airports (India)
+INSERT INTO airports (iata_code, name, city, country, timezone) VALUES
+('BOM','Chhatrapati Shivaji Maharaj Intl','Mumbai','India','Asia/Kolkata'),
+('DEL','Indira Gandhi Intl','New Delhi','India','Asia/Kolkata'),
+('BLR','Kempegowda Intl','Bengaluru','India','Asia/Kolkata');
+
+-- Aircraft model + one aircraft
+INSERT INTO aircraft_models (manufacturer, model_name, seat_capacity, notes)
+VALUES ('Airbus','A320', 180, 'Typical 3-3 single aisle');
+
+INSERT INTO aircrafts (tail_number, model_id, in_service) VALUES ('VT-ABC', 1, 1);
+
+-- Generate seats for that aircraft
+CALL sp_seed_aircraft_seats(1);
+
+-- Flights and base fares
+INSERT INTO flights (flight_number, origin_airport_id, destination_airport_id, scheduled_duration_mins, distance_km)
+VALUES
+('AI101', (SELECT airport_id FROM airports WHERE iata_code='BOM'),
+          (SELECT airport_id FROM airports WHERE iata_code='DEL'), 120, 1148),
+('AI202', (SELECT airport_id FROM airports WHERE iata_code='DEL'),
+          (SELECT airport_id FROM airports WHERE iata_code='BLR'), 150, 1740);
+
+INSERT INTO flight_fares (flight_id, cabin_class, base_price) VALUES
+(1, 'ECONOMY', 4500.00),
+(1, 'BUSINESS', 12500.00),
+(2, 'ECONOMY', 5500.00),
+(2, 'BUSINESS', 14500.00);
+
+-- Two dated instances using the same aircraft for demo
+INSERT INTO flight_instances (flight_id, aircraft_id, departure_datetime, arrival_datetime, status)
+VALUES
+(1, 1, '2025-08-21 09:00:00', '2025-08-21 11:00:00', 'SCHEDULED'),
+(2, 1, '2025-08-21 13:30:00', '2025-08-21 16:00:00', 'SCHEDULED');
+
+-- -------------------------------------------------------------
+-- 9) Demo: create a customer, passengers, booking, tickets & payment
+-- -------------------------------------------------------------
+
+-- Customer & passengers
+INSERT INTO customers (full_name, email, phone) VALUES
+('Khalil Shaikh','khalil@example.com','+91-9000000000');
+
+INSERT INTO passengers (full_name, dob, gender, passport_no, nationality, customer_id) VALUES
+('Khalil Shaikh','2001-01-01','M','P1234567','IN', 1),
+('Ayaan Shaikh','2003-03-03','M','P2345678','IN', 1);
+
+-- Create booking (leave PNR blank to autogenerate)
+INSERT INTO bookings (pnr, customer_id, status, payment_status)
+VALUES ('', 1, 'PENDING','UNPAID');
+
+-- Price from base fare for ECONOMY on AI101 instance (2 passengers)
+INSERT INTO tickets (booking_id, passenger_id, flight_instance_id, fare_class, price_paid)
+SELECT 1, p.passenger_id, 1, 'ECONOMY',
+       (SELECT base_price FROM flight_fares WHERE flight_id = (SELECT flight_id FROM flight_instances WHERE flight_instance_id=1) AND cabin_class='ECONOMY')
+FROM passengers p
+WHERE p.passenger_id IN (1,2);
+
+-- Procedure to assign all unassigned seats in a booking
+DELIMITER $$
+CREATE PROCEDURE sp_assign_seats_for_booking(IN p_booking_id INT)
+BEGIN
+  WHILE EXISTS (SELECT 1 FROM tickets WHERE booking_id = p_booking_id AND seat_id IS NULL) DO
+    UPDATE tickets t
+    JOIN (
+        SELECT t.ticket_id, s.seat_id
+        FROM tickets t
+        JOIN flight_instances fi ON fi.flight_instance_id = t.flight_instance_id
+        JOIN seats s ON s.aircraft_id = fi.aircraft_id
+        LEFT JOIN tickets t2 
+               ON t2.flight_instance_id = t.flight_instance_id 
+              AND t2.seat_id = s.seat_id 
+              AND t2.status IN ('BOOKED','CHECKED_IN','BOARDED')
+        WHERE t.booking_id = p_booking_id
+          AND t.seat_id IS NULL
+          AND s.cabin_class = 'ECONOMY'
+          AND t2.ticket_id IS NULL
+        ORDER BY s.seat_number
+        LIMIT 1
+    ) x ON t.ticket_id = x.ticket_id
+    SET t.seat_id = x.seat_id;
+  END WHILE;
+END$$
+DELIMITER ;
+
+-- Assign seats automatically for all passengers in booking 1
+CALL sp_assign_seats_for_booking(1);
+
+
+-- Make payment -> auto-confirm booking via trigger
+INSERT INTO payments (booking_id, amount, method, status, txn_ref, paid_at)
+VALUES (1, (SELECT total_amount FROM bookings WHERE booking_id=1), 'UPI', 'SUCCESS', 'UPI-TEST-001', NOW());
+
+-- -------------------------------------------------------------
+-- 10) Example Queries (copy/paste to learn)
+-- -------------------------------------------------------------
+
+-- A) Search BOM -> DEL on 2025-08-21 for 2 seats
+CALL sp_search_flights('BOM','DEL','2025-08-21', 2);
+
+-- B) Check availability per cabin for the flight instance
+SELECT * FROM v_flight_availability WHERE flight_instance_id = 1;
+
+-- C) Show booking summary
+SELECT * FROM v_booking_summary WHERE booking_id = 1;
+
+-- D) Cancel a ticket (releases seat implicitly since view ignores CANCELLED):
+-- UPDATE tickets SET status = 'CANCELLED' WHERE ticket_id = 1;
+
+-- E) Create another booking inside a transaction (pattern)
+ START TRANSACTION;
+INSERT INTO bookings (pnr, customer_id) VALUES ('', 1);
+SET @new_booking_id = LAST_INSERT_ID();
+INSERT INTO tickets (booking_id, passenger_id, flight_instance_id, fare_class, price_paid)
+VALUES (@new_booking_id, 1, 1, 'ECONOMY', 4500.00);
+COMMIT;
+
+-- -- Seat assignment (first free ECONOMY seat)
+UPDATE tickets t
+JOIN (
+    SELECT s.seat_id, t.ticket_id
+    FROM tickets t
+    JOIN flight_instances fi ON fi.flight_instance_id = t.flight_instance_id
+    JOIN seats s ON s.aircraft_id = fi.aircraft_id
+    LEFT JOIN tickets t2 
+           ON t2.flight_instance_id = t.flight_instance_id 
+          AND t2.seat_id = s.seat_id 
+          AND t2.status IN ('BOOKED','CHECKED_IN','BOARDED')
+    WHERE t.ticket_id = LAST_INSERT_ID()
+      AND s.cabin_class = 'ECONOMY'
+      AND t2.ticket_id IS NULL
+    ORDER BY s.seat_number
+    LIMIT 1
+) x ON t.ticket_id = x.ticket_id
+SET t.seat_id = x.seat_id;
+
+-- F) Cancel entire booking:
+UPDATE bookings SET status='CANCELLED' WHERE booking_id=1;
+
+SELECT * 
+FROM v_flight_availability 
+WHERE flight_instance_id = 1;
+
+SELECT t.ticket_id, p.full_name, p.passport_no, t.status, s.seat_number
+FROM tickets t
+JOIN passengers p ON p.passenger_id = t.passenger_id
+LEFT JOIN seats s ON s.seat_id = t.seat_id
+WHERE t.flight_instance_id = 1
+ORDER BY s.seat_number;
+
+SELECT fi.flight_instance_id, f.flight_number,
+       SUM(t.price_paid) AS total_revenue,
+       COUNT(t.ticket_id) AS tickets_sold
+FROM tickets t
+JOIN flight_instances fi ON fi.flight_instance_id = t.flight_instance_id
+JOIN flights f ON f.flight_id = fi.flight_id
+WHERE fi.departure_datetime BETWEEN '2025-08-01' AND '2025-08-31'
+GROUP BY fi.flight_instance_id, f.flight_number
+ORDER BY total_revenue DESC;
+
