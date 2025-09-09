@@ -15,8 +15,8 @@ A beginner-friendly, one-file MySQL 8 schema for an Airline Reservation System:
 
 ```bash
 # 1) Clone and run the SQL
-git clone https://github.com/<your-username>/airline-reservation-db.git
-cd airline-reservation-db
+git clone https://github.com/ShaikhKhalil/Airline-Reservation-SQL-Live-Project.git
+cd Airline-Reservation-SQL-Live-Project
 
-# 2) Run the script (it creates the DB and demo data)
+# Run the script
 mysql -u <user> -p < sql/airline_reservation.sql
